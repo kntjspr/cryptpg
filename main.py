@@ -32,6 +32,12 @@ BACKUP_DIR = os.environ.get("BACKUP_DIR", str(SCRIPT_DIR / "backups"))
 # telegram config (leave empty to disable)
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+TELEGRAM_API_ID = os.environ.get("TELEGRAM_API_ID", "")
+TELEGRAM_API_HASH = os.environ.get("TELEGRAM_API_HASH", "")
+# optional mtproto proxy (only works if api_id/hash are set)
+MTPROTO_PROXY_HOST = os.environ.get("MTPROTO_PROXY_HOST", "")
+MTPROTO_PROXY_PORT = os.environ.get("MTPROTO_PROXY_PORT", "")
+MTPROTO_PROXY_SECRET = os.environ.get("MTPROTO_PROXY_SECRET", "")
 
 # postgres defaults
 PG_HOST = os.environ.get("DB_HOST", "localhost")
@@ -101,12 +107,53 @@ def get_pg_env(host: str, port: str, user: str, password: str, sslmode: str = No
     return env
 
 
+def _get_telethon_client():
+    from telethon.sync import TelegramClient
+    from telethon.sessions import StringSession
+    from telethon.network import ConnectionTcpMTProxyRandomizedIntermediate
+    
+    proxy = None
+    connection = None
+    if MTPROTO_PROXY_HOST and MTPROTO_PROXY_PORT and MTPROTO_PROXY_SECRET:
+        proxy = (MTPROTO_PROXY_HOST, int(MTPROTO_PROXY_PORT), MTPROTO_PROXY_SECRET)
+        connection = ConnectionTcpMTProxyRandomizedIntermediate
+        
+    kwargs = {}
+    if proxy:
+        kwargs["proxy"] = proxy
+        kwargs["connection"] = connection
+        
+    return TelegramClient(StringSession(), int(TELEGRAM_API_ID), TELEGRAM_API_HASH, **kwargs)
+
+
 def send_telegram_file(filepath: str, caption: str = "") -> bool:
     """upload file to telegram. returns True on success."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         log.info("telegram not configured, skipping upload")
         return False
-    
+        
+    chat_id = TELEGRAM_CHAT_ID
+    try:
+        chat_id = int(chat_id)
+    except ValueError:
+        pass
+
+    if TELEGRAM_API_ID and TELEGRAM_API_HASH:
+        log.info("using mtproto for file upload...")
+        try:
+            client = _get_telethon_client()
+            client.start(bot_token=TELEGRAM_BOT_TOKEN)
+            client.send_file(chat_id, filepath, caption=caption)
+            client.disconnect()
+            log.info("uploaded to telegram (mtproto) successfully")
+            return True
+        except ImportError:
+            log.error("telethon not installed. run: pip install telethon")
+            return False
+        except Exception as e:
+            log.error(f"mtproto upload error: {e}")
+            return False
+
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
     
     try:
@@ -131,7 +178,23 @@ def send_telegram_message(message: str) -> bool:
     """send a text message to telegram."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return False
-    
+        
+    chat_id = TELEGRAM_CHAT_ID
+    try:
+        chat_id = int(chat_id)
+    except ValueError:
+        pass
+
+    if TELEGRAM_API_ID and TELEGRAM_API_HASH:
+        try:
+            client = _get_telethon_client()
+            client.start(bot_token=TELEGRAM_BOT_TOKEN)
+            client.send_message(chat_id, message, parse_mode="html")
+            client.disconnect()
+            return True
+        except Exception:
+            return False
+            
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     
     try:
@@ -249,8 +312,9 @@ def export_db(args):
         encrypted_status = "🔓 unencrypted" if args.no_encrypt else "🔒 encrypted"
         caption = f"📦 {args.database} backup\n{conn_info}\n📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n💾 {size_mb:.2f} MB\n{encrypted_status}"
         
-        # telegram file size limit is 50MB for bots
-        if file_size > 50 * 1024 * 1024:
+        # telegram file size limit is 50MB for bots (http api)
+        is_mtproto = bool(TELEGRAM_API_ID and TELEGRAM_API_HASH)
+        if not is_mtproto and file_size > 50 * 1024 * 1024:
             log.warning("file too large for telegram (>50MB), sending notification only")
             send_telegram_message(f"✅ <b>Backup Complete</b>\n\n<b>Database:</b> {args.database}\n<b>Host:</b> {args.host}:{args.port}\n<b>User:</b> {args.user}\n<b>SSL:</b> {args.sslmode}\n<b>Size:</b> {size_mb:.2f} MB\n<b>Status:</b> {encrypted_status}\n<b>Path:</b> {output_path}\n\n⚠️ File too large for Telegram upload")
         else:
