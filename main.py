@@ -23,7 +23,7 @@ SCRIPT_DIR = Path(__file__).parent.resolve()
 load_dotenv(SCRIPT_DIR / ".env")
 
 # ============ CONFIG  ============
-ENCRYPTION_PASSWORD = os.environ.get("DB_PASSWORD", "your-secret-password-here")
+ENCRYPTION_PASSWORD = os.environ.get("ENCRYPTION_PASSWORD", os.environ.get("DB_PASSWORD", "your-secret-password-here"))
 
 # where backups go (relative to script dir, or set absolute path for cron)
 SCRIPT_DIR = Path(__file__).parent.resolve()
@@ -145,6 +145,61 @@ def send_telegram_message(message: str) -> bool:
         return False
 
 
+def check_connections(args) -> bool:
+    """test postgres and telegram connections."""
+    success = True
+    log.info("testing postgres connection...")
+    pg_env = get_pg_env(args.host, args.port, args.user, args.password, args.sslmode)
+    
+    cmd = ["pg_isready", "-h", args.host, "-p", str(args.port), "-U", args.user]
+    result = run_cmd(cmd, env=pg_env)
+    
+    if result.returncode == 0:
+        log.info("postgres connection successful")
+    else:
+        err_out = result.stderr.decode().strip() or result.stdout.decode().strip()
+        log.error(f"postgres connection failed: {err_out}")
+        success = False
+        
+    log.info("testing telegram connection...")
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        log.info("telegram not configured (skipping)")
+    else:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getMe"
+        try:
+            response = requests.get(url, timeout=10)
+            if response.status_code == 200:
+                log.info("telegram bot token valid")
+                msg_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+                msg_response = requests.post(msg_url, data={
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "text": "🛠️ <b>Connection test successful</b>",
+                    "parse_mode": "HTML"
+                }, timeout=10)
+                if msg_response.status_code == 200:
+                    log.info("telegram message sent successfully")
+                else:
+                    log.error(f"telegram message failed (check chat ID): {msg_response.text}")
+                    success = False
+            else:
+                log.error(f"telegram bot token invalid: {response.text}")
+                success = False
+        except Exception as e:
+            log.error(f"telegram reachability error: {e}")
+            success = False
+            
+    return success
+
+
+def run_test(args):
+    """run the standalone connection test."""
+    if check_connections(args):
+        log.info("all tests passed!")
+    else:
+        log.error("some tests failed")
+        sys.exit(1)
+
+
 def export_db(args):
     """dump postgres db, encrypt, and optionally upload to telegram."""
     pg_env = get_pg_env(args.host, args.port, args.user, args.password, args.sslmode)
@@ -178,7 +233,7 @@ def export_db(args):
         data_to_write = dump_result.stdout
     else:
         log.info("encrypting dump...")
-        data_to_write = encrypt_data(dump_result.stdout, ENCRYPTION_PASSWORD)
+        data_to_write = encrypt_data(dump_result.stdout, args.encrypt_key)
     
     with open(output_path, "wb") as f:
         f.write(data_to_write)
@@ -238,7 +293,7 @@ def import_db(args):
     else:
         log.info("decrypting backup...")
         try:
-            restore_data = decrypt_data(file_data, ENCRYPTION_PASSWORD)
+            restore_data = decrypt_data(file_data, args.encrypt_key)
         except Exception as e:
             log.error(f"decryption failed (wrong password or not encrypted?): {e}")
             sys.exit(1)
@@ -327,18 +382,23 @@ cronjob example (daily at 3am, keep 7 days):
     export_parser.add_argument("-b", "--backup-dir", default=BACKUP_DIR, help=f"backup directory (default: {BACKUP_DIR})")
     export_parser.add_argument("--retain", type=int, help="keep only N most recent backups")
     export_parser.add_argument("--no-encrypt", action="store_true", help="skip encryption (save raw pg_dump)")
+    export_parser.add_argument("-k", "--encrypt-key", default=ENCRYPTION_PASSWORD, help="override encryption password")
     
     import_parser = subparsers.add_parser("import", help="import database (optionally decrypt, wipes target!)")
     add_common_args(import_parser)
     import_parser.add_argument("-i", "--input", required=True, help="backup file to restore")
     import_parser.add_argument("--no-decrypt", action="store_true", help="skip decryption (raw pg_dump file)")
+    import_parser.add_argument("-k", "--encrypt-key", default=ENCRYPTION_PASSWORD, help="override encryption password")
+    
+    test_parser = subparsers.add_parser("test", help="test connections to postgres and telegram")
+    add_common_args(test_parser)
     
     args = parser.parse_args()
     
     if not args.password:
         args.password = os.environ.get("PGPASSWORD", PG_PASSWORD)
     
-    if not args.database:
+    if args.command != "test" and not args.database:
         log.error("database name required. set PG_DATABASE in config or use -d flag")
         sys.exit(1)
     
@@ -346,6 +406,8 @@ cronjob example (daily at 3am, keep 7 days):
         export_db(args)
     elif args.command == "import":
         import_db(args)
+    elif args.command == "test":
+        run_test(args)
 
 
 if __name__ == "__main__":
