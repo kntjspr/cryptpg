@@ -38,6 +38,8 @@ TELEGRAM_API_HASH = os.environ.get("TELEGRAM_API_HASH", "")
 MTPROTO_PROXY_HOST = os.environ.get("MTPROTO_PROXY_HOST", "")
 MTPROTO_PROXY_PORT = os.environ.get("MTPROTO_PROXY_PORT", "")
 MTPROTO_PROXY_SECRET = os.environ.get("MTPROTO_PROXY_SECRET", "")
+# tor switch
+USE_TOR = os.environ.get("USE_TOR", "").lower() == "true"
 
 # postgres defaults
 PG_HOST = os.environ.get("DB_HOST", "localhost")
@@ -114,7 +116,14 @@ def _get_telethon_client():
     
     proxy = None
     connection = None
-    if MTPROTO_PROXY_HOST and MTPROTO_PROXY_PORT and MTPROTO_PROXY_SECRET:
+    if USE_TOR:
+        try:
+            import socks
+            proxy = (socks.SOCKS5, '127.0.0.1', 9050)
+        except ImportError:
+            log.error("PySocks not installed. run: pip install pysocks")
+            raise
+    elif MTPROTO_PROXY_HOST and MTPROTO_PROXY_PORT and MTPROTO_PROXY_SECRET:
         proxy = (MTPROTO_PROXY_HOST, int(MTPROTO_PROXY_PORT), MTPROTO_PROXY_SECRET)
         connection = ConnectionTcpMTProxyRandomizedIntermediate
         
@@ -156,12 +165,16 @@ def send_telegram_file(filepath: str, caption: str = "") -> bool:
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
     
+    proxies = None
+    if USE_TOR:
+        proxies = {'http': 'socks5h://127.0.0.1:9050', 'https': 'socks5h://127.0.0.1:9050'}
+    
     try:
         with open(filepath, "rb") as f:
             files = {"document": (os.path.basename(filepath), f)}
             data = {"chat_id": TELEGRAM_CHAT_ID, "caption": caption[:1024]}  # telegram caption limit
             
-            response = requests.post(url, files=files, data=data, timeout=300)
+            response = requests.post(url, files=files, data=data, timeout=300, proxies=proxies)
             
             if response.status_code == 200:
                 log.info("uploaded to telegram successfully")
@@ -197,12 +210,16 @@ def send_telegram_message(message: str) -> bool:
             
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     
+    proxies = None
+    if USE_TOR:
+        proxies = {'http': 'socks5h://127.0.0.1:9050', 'https': 'socks5h://127.0.0.1:9050'}
+    
     try:
         response = requests.post(url, data={
             "chat_id": TELEGRAM_CHAT_ID,
             "text": message,
             "parse_mode": "HTML"
-        }, timeout=30)
+        }, timeout=30, proxies=proxies)
         return response.status_code == 200
     except Exception:
         return False
@@ -229,8 +246,12 @@ def check_connections(args) -> bool:
         log.info("telegram not configured (skipping)")
     else:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getMe"
+        proxies = None
+        if USE_TOR:
+            proxies = {'http': 'socks5h://127.0.0.1:9050', 'https': 'socks5h://127.0.0.1:9050'}
+            
         try:
-            response = requests.get(url, timeout=10)
+            response = requests.get(url, timeout=10, proxies=proxies)
             if response.status_code == 200:
                 log.info("telegram bot token valid")
                 msg_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -238,7 +259,7 @@ def check_connections(args) -> bool:
                     "chat_id": TELEGRAM_CHAT_ID,
                     "text": "🛠️ <b>Connection test successful</b>",
                     "parse_mode": "HTML"
-                }, timeout=10)
+                }, timeout=10, proxies=proxies)
                 if msg_response.status_code == 200:
                     log.info("telegram message sent successfully")
                 else:
