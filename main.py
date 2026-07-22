@@ -12,11 +12,14 @@ import os
 import hashlib
 import logging
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
 from dotenv import load_dotenv
+import dropbox
+from dropbox.files import WriteMode
+from dropbox.exceptions import ApiError
 
 # load .env from script directory
 SCRIPT_DIR = Path(__file__).parent.resolve()
@@ -28,6 +31,12 @@ ENCRYPTION_PASSWORD = os.environ.get("ENCRYPTION_PASSWORD", os.environ.get("DB_P
 # where backups go (relative to script dir, or set absolute path for cron)
 SCRIPT_DIR = Path(__file__).parent.resolve()
 BACKUP_DIR = os.environ.get("BACKUP_DIR", str(SCRIPT_DIR / "backups"))
+
+# dropbox config
+DROPBOX_ACCESS_TOKEN = os.environ.get("DROPBOX_ACCESS_TOKEN", "")
+DROPBOX_FOLDER = os.environ.get("DROPBOX_FOLDER", "/backups")
+LOCAL_RETENTION_DAYS = os.environ.get("LOCAL_RETENTION_DAYS", "")
+DROPBOX_RETENTION_DAYS = os.environ.get("DROPBOX_RETENTION_DAYS", "")
 
 # telegram config (leave empty to disable)
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -340,10 +349,18 @@ def export_db(args):
             send_telegram_message(f"✅ <b>Backup Complete</b>\n\n<b>Database:</b> {args.database}\n<b>Host:</b> {args.host}:{args.port}\n<b>User:</b> {args.user}\n<b>SSL:</b> {args.sslmode}\n<b>Size:</b> {size_mb:.2f} MB\n<b>Status:</b> {encrypted_status}\n<b>Path:</b> {output_path}\n\n⚠️ File too large for Telegram upload")
         else:
             send_telegram_file(str(output_path), caption)
+            
+    # upload to dropbox if configured
+    if args.dropbox_token:
+        upload_to_dropbox(str(output_path), args.dropbox_folder, args.dropbox_token)
     
     # cleanup old backups if retention is set
     if args.retain:
         cleanup_old_backups(backup_dir, args.database, args.retain)
+    if args.local_retention_days:
+        cleanup_local_backups_by_days(backup_dir, args.database, args.local_retention_days)
+    if args.dropbox_token and args.dropbox_retention_days:
+        cleanup_dropbox_backups_by_days(args.dropbox_token, args.dropbox_folder, args.database, args.dropbox_retention_days)
     
     log.info("done!")
 
@@ -356,6 +373,78 @@ def cleanup_old_backups(backup_dir: Path, database: str, retain: int):
     for old_backup in backups[retain:]:
         log.info(f"removing old backup: {old_backup.name}")
         old_backup.unlink()
+
+
+def cleanup_local_backups_by_days(backup_dir: Path, database: str, days: int):
+    """delete local backups older than N days."""
+    pattern = f"{database}_*.enc"
+    cutoff = datetime.now() - timedelta(days=days)
+    
+    for backup_file in backup_dir.glob(pattern):
+        mtime = datetime.fromtimestamp(backup_file.stat().st_mtime)
+        if mtime < cutoff:
+            log.info(f"removing old local backup: {backup_file.name}")
+            backup_file.unlink()
+
+
+def upload_to_dropbox(local_path: str, dropbox_folder: str, token: str) -> bool:
+    if not token:
+        return False
+    try:
+        dbx = dropbox.Dropbox(token)
+        filename = os.path.basename(local_path)
+        db_folder = dropbox_folder.rstrip('/')
+        if not db_folder.startswith('/'):
+            db_folder = '/' + db_folder
+        dropbox_path = f"{db_folder}/{filename}"
+        
+        with open(local_path, "rb") as f:
+            log.info(f"uploading {local_path} to dropbox ({dropbox_path})...")
+            meta = dbx.files_upload(
+                f.read(), 
+                dropbox_path, 
+                mode=WriteMode("overwrite")
+            )
+            log.info(f"uploaded to dropbox successfully: {meta.path_display}")
+            return True
+    except FileNotFoundError:
+        log.error(f"dropbox upload error: local file '{local_path}' not found")
+    except ApiError as err:
+        log.error(f"dropbox api error: {err}")
+    except Exception as e:
+        log.error(f"dropbox upload error: {e}")
+    return False
+
+
+def cleanup_dropbox_backups_by_days(token: str, dropbox_folder: str, database: str, days: int):
+    """delete dropbox backups older than N days."""
+    if not token:
+        return
+    try:
+        dbx = dropbox.Dropbox(token)
+        db_folder = dropbox_folder.rstrip('/')
+        if not db_folder.startswith('/'):
+            db_folder = '/' + db_folder
+            
+        cutoff = datetime.now() - timedelta(days=days)
+        result = dbx.files_list_folder(db_folder)
+        
+        while True:
+            for entry in result.entries:
+                if isinstance(entry, dropbox.files.FileMetadata):
+                    if entry.name.startswith(f"{database}_") and entry.name.endswith(".enc"):
+                        if entry.client_modified < cutoff:
+                            log.info(f"removing old dropbox backup: {entry.path_display}")
+                            dbx.files_delete_v2(entry.path_display)
+            
+            if not result.has_more:
+                break
+            result = dbx.files_list_folder_continue(result.cursor)
+            
+    except ApiError as err:
+        log.error(f"dropbox api error during cleanup: {err}")
+    except Exception as e:
+        log.error(f"dropbox cleanup error: {e}")
 
 
 def import_db(args):
@@ -466,6 +555,10 @@ cronjob example (daily at 3am, keep 7 days):
     export_parser.add_argument("-o", "--output", help="output filename (optional)")
     export_parser.add_argument("-b", "--backup-dir", default=BACKUP_DIR, help=f"backup directory (default: {BACKUP_DIR})")
     export_parser.add_argument("--retain", type=int, help="keep only N most recent backups")
+    export_parser.add_argument("--local-retention-days", type=int, default=int(LOCAL_RETENTION_DAYS) if LOCAL_RETENTION_DAYS else None, help="delete local backups older than N days")
+    export_parser.add_argument("--dropbox-token", default=DROPBOX_ACCESS_TOKEN, help="dropbox access token")
+    export_parser.add_argument("--dropbox-folder", default=DROPBOX_FOLDER, help="dropbox destination folder")
+    export_parser.add_argument("--dropbox-retention-days", type=int, default=int(DROPBOX_RETENTION_DAYS) if DROPBOX_RETENTION_DAYS else None, help="delete dropbox backups older than N days")
     export_parser.add_argument("--no-encrypt", action="store_true", help="skip encryption (save raw pg_dump)")
     export_parser.add_argument("-k", "--encrypt-key", default=ENCRYPTION_PASSWORD, help="override encryption password")
     
